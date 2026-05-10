@@ -46,13 +46,18 @@ A developer productivity platform that connects to GitHub and surfaces engineeri
 
 ### Features
 
-- **PR Analytics** — cycle time (p50/p90), time-to-first-review, review-wait excluding off-hours, size distribution, force-push & rebase aware
-- **Team Metrics** — review load per developer, bus factor per directory, contribution patterns
-- **Deploy Tracking** — frequency, lead time for changes, change failure rate, MTTR (the four DORA metrics)
-- **AI Query Interface** — natural-language questions answered via constrained text-to-SQL over the metrics warehouse, with the generated SQL shown to the user
-- **Anomaly Detection** — z-score + EWMA over rolling baselines per metric/repo/team, with LLM-generated root-cause hypotheses grounded in the underlying PRs
-- **Alerts** — Slack/email when metrics breach thresholds, deduped by incident key
-- **Real-Time Updates** — GitHub webhooks for push/PR/deployment events; polling fallback for backfill
+**Built and shipping:**
+- **PR Analytics** — cycle time (p50/p90), time-to-first-review, review-wait excluding off-hours, force-push & rebase aware
+- **Team Metrics** — review load per developer, average response time, contribution patterns
+- **Deploy Tracking** — frequency, change failure rate, rollback rate
+- **AI Query Interface** — natural-language questions answered via constrained text-to-SQL over an allow-listed view set, with the generated SQL shown to the user
+- **EWMA baseline computation** — per-repo rolling baselines stored in `metric_baselines` (foundation for anomaly detection)
+- **GitHub OAuth + GraphQL/REST sync** — token-bucket rate limiting, ETag-conditional requests, PR timeline reconstruction in the worker
+
+**Designed but not yet built (see Roadmap):**
+- Anomaly *detection* (z-score check + alerting) on top of the EWMA baselines
+- Slack / email alerts when metrics breach thresholds
+- GitHub webhook ingester for real-time updates (currently polling-only)
 
 ## Tech Stack (All Free-Tier)
 
@@ -66,8 +71,8 @@ A developer productivity platform that connects to GitHub and surfaces engineeri
 | GitHub Data | REST + GraphQL + Webhooks (5K req/hr authed) | $0 |
 | LLM | Groq (Llama 3.3 70B) for insights, structured output for SQL | $0 |
 | Auth | GitHub OAuth + signed session cookies | $0 |
-| Observability | Pino structured logs → Better Stack; OpenTelemetry traces | $0 |
-| CI/CD | GitHub Actions + Testcontainers for integration tests | $0 |
+| Observability | Pino structured logs (Better Stack / OpenTelemetry sinks ready to wire) | $0 |
+| CI/CD | GitHub Actions (Postgres + Redis service containers) | $0 |
 
 ## Architecture
 
@@ -75,33 +80,33 @@ A developer productivity platform that connects to GitHub and surfaces engineeri
                     ┌──────────────┐
                     │   GitHub     │
                     └──────┬───────┘
-              webhooks     │     REST/GraphQL
-                  ▼        │        ▲
-          ┌──────────┐     │        │ (rate-limited,
-          │ Webhook  │     │        │  ETag-cached)
-          │ ingester │─────┼────────┤
-          └────┬─────┘     │        │
-               │           ▼        │
-               │     ┌──────────────┴───┐
-               └────▶│  BullMQ queue    │
-                     │ (Upstash Redis)  │
+                           │     REST/GraphQL
+                           │        ▲
+                           │        │ (rate-limited via token
+                           │        │  bucket, ETag-conditional)
+                           ▼        │
+                     ┌──────────────┴───┐
+                     │  BullMQ queue    │
+                     │ (Redis)          │
                      └─────────┬────────┘
                                ▼
        ┌──────────────────────────────────────────┐
        │  Worker process                           │
-       │  • incremental sync (cursor + since)     │
-       │  • PR event reconstruction               │
-       │  • metric rollups → materialized tables  │
-       │  • anomaly scan (every 15m)              │
+       │  • incremental sync (since cursors)      │
+       │  • PR timeline reconstruction            │
+       │  • per-PR metric computation             │
+       │  • EWMA baselines → metric_baselines     │
        └─────────────────┬────────────────────────┘
                          ▼
                  ┌───────────────┐
                  │   Postgres    │◀──── API (Fastify)
-                 │   (Neon)      │      • /metrics/*
-                 └───────────────┘      • /ask  (text-to-SQL)
-                         ▲              • /insights/:id
-                         │              • OAuth, RBAC
-                         └─────── Frontend (React)
+                 │               │      • /metrics/* (summary, trend, team, recent)
+                 └───────────────┘      • /ask  (text-to-SQL with AST guardrail)
+                         ▲              • /auth/github (OAuth + sessions)
+                         │              • /repos
+                         └─────── Frontend (React + TanStack Query)
+
+(Planned: GitHub webhook ingester, anomaly scan, Slack alerts.)
 ```
 
 ### Repo Layout
@@ -132,13 +137,13 @@ devpulse/
 - *review-wait* — sum of intervals where the ball was in a reviewer's court, excluding configured off-hours
 - *coding time* — first commit on branch → ready_for_review
 
-**2. GitHub's 5K req/hr limit forces a real ingestion design.** The worker uses conditional requests (`If-None-Match` with stored ETags), GraphQL for fan-out queries (one query for a PR's reviews + checks + commits), incremental sync with `since` cursors, and a token bucket to stay under the limit per installation. Webhooks handle the live tail; polling handles backfill and reconciliation.
+**2. GitHub's 5K req/hr limit forces a real ingestion design.** The worker uses conditional requests (`If-None-Match` with stored ETags), GraphQL for fan-out queries (one query for a PR's reviews + commits + timeline events), incremental sync with `since` cursors, and a token bucket to stay under the limit per installation. (A webhook ingester is on the roadmap — current implementation is polling-only.)
 
 **3. Text-to-SQL with guardrails.** `/ask` sends the user's question + a curated schema prompt to Groq with structured-output enforcement. Generated SQL is parsed with `pgsql-ast-parser`, rejected if it touches anything outside an allow-listed view set, executed against a read-only role with a 2s statement timeout, and shown to the user before results render. No raw LLM output ever reaches the database.
 
-**4. Anomaly detection that doesn't cry wolf.** Per (metric, repo, team) tuple, we maintain an EWMA + rolling stddev over a 30-day window stored in a `metric_baselines` table. Alerts fire only when z > 2 *and* the absolute change clears a per-metric floor (e.g. cycle time must move ≥1hr). LLM is called only after the statistical filter passes, to draft a human-readable hypothesis grounded in the PRs that drove the change — never to decide whether to alert.
+**4. EWMA baselines as the foundation for honest anomaly detection.** Per (metric, repo) tuple, the worker maintains an EWMA + Welford's running stddev over a 30-day window in `metric_baselines`. The detector itself (alert when z > 2 *and* absolute change clears a per-metric floor) is on the roadmap — but the harder problem (numerically stable streaming statistics) is already solved and unit-tested. The next step is a 30-line scan job that reads baselines and writes alerts.
 
-**5. Tested like production.** Unit tests for the metric engine (golden fixtures of recorded GitHub timelines). Integration tests with Testcontainers spinning up real Postgres + Redis — no mocks at the DB boundary. Contract tests against GitHub's API using recorded fixtures (`nock`).
+**5. Real unit tests, not theater.** 14 tests in `@devpulse/metrics` cover the PR timeline state machine (changes_requested handoff, weekend off-hours, force-push edge cases, out-of-order events) plus statistical primitives (percentile interpolation, Welford stddev matches numpy, EWMA boundaries). 10 tests in `@devpulse/ai` prove the SQL guardrail rejects DROP, DELETE, UPDATE, stacked queries, and subquery escapes — using AST parsing, not regex. Total: 24 tests, all passing in CI.
 
 ## Run Locally
 
@@ -153,9 +158,14 @@ pnpm dev                        # runs api (:4000), worker, web (:5173) in paral
 ```
 
 Open http://localhost:5173 — the dashboard renders against the seeded data
-immediately. Set `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` and the
+immediately. (If 5173 is in use, Vite picks the next free port — check the
+terminal output.) Set `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` and the
 "Connect GitHub" button in the nav goes live. Set `GROQ_API_KEY` and the
 **Ask** page becomes functional.
+
+> If `5432` or `6379` are taken on your machine (e.g. you already run
+> Postgres or Redis locally), set `POSTGRES_HOST_PORT` / `REDIS_HOST_PORT`
+> in your `.env` and update `DATABASE_URL` / `REDIS_URL` to match.
 
 ### Useful scripts
 
