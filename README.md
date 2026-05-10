@@ -2,6 +2,17 @@
 
 A developer productivity platform that connects to GitHub and surfaces engineering metrics — PR cycle time, review bottlenecks, deploy frequency — alongside an LLM-powered query interface and anomaly detector. The analytics tool engineering managers wish they had.
 
+![DevPulse dashboard](docs/screenshots/dashboard.png)
+
+## Screens
+
+| | |
+|---|---|
+| ![Pull Requests](docs/screenshots/prs.png) | ![Team review load](docs/screenshots/team.png) |
+| **Pull Requests** — every PR with cycle time, state, author | **Team** — review load and avg response time per reviewer |
+| ![Ask DevPulse](docs/screenshots/ask.png) | |
+| **Ask DevPulse** — text-to-SQL with AST-allow-listed views and a 2s read-only execution sandbox | |
+
 ## Why This Project
 
 - **AI-integrated full-stack** is the new default in 2026 job postings
