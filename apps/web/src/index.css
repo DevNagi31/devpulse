@@ -20,7 +20,7 @@
     @apply bg-white/70 backdrop-blur-xl border border-white/60 shadow-glass rounded-2xl;
   }
   .nav-blur {
-    @apply bg-white/72 backdrop-blur-2xl border-b border-ink-100;
+    @apply bg-white/70 backdrop-blur-2xl border-b border-ink-100;
   }
   .btn-primary {
     @apply inline-flex items-center justify-center rounded-full bg-accent px-5 py-2 text-sm
